@@ -2617,7 +2617,7 @@ def uninstall(args):
             del settings['statusLine']
             what = 'removed the status line'
         try:
-            if not settings and cfg.get('settings_created') and Path(os.path.realpath(SETTINGS)) == SETTINGS:
+            if not settings and cfg.get('settings_created') and not SETTINGS.is_symlink():
                 SETTINGS.unlink()  # install created it and nothing else was added since
                 print(f'{SETTINGS}: {what} (install had created the file, so it is gone again).')
             else:
