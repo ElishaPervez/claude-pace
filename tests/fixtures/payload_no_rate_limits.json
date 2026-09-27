@@ -1,0 +1,15 @@
+{
+  "hook_event_name": "Status",
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "cwd": "/tmp/project",
+  "model": {"id": "claude-opus-5-5", "display_name": "Opus"},
+  "workspace": {"current_dir": "/tmp/project", "project_dir": "/tmp/project"},
+  "context_window": {
+    "current_usage": {
+      "input_tokens": 12,
+      "output_tokens": 480,
+      "cache_creation_input_tokens": 1500,
+      "cache_read_input_tokens": 42000
+    }
+  }
+}

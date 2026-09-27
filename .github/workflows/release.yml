@@ -1,0 +1,113 @@
+name: Release
+
+# Push a tag like v1.0.0 to publish. The full test matrix runs first; the
+# GitHub release is only created if every OS passes, and PyPI only gets the
+# package once the GitHub release exists (a PyPI version can never be
+# re-uploaded, so it goes last).
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Check the tag matches the script's version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(python3 claude_pace.py --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^ ]*' | head -1)
+          echo "tag $tag, script $ver"
+          [ "$tag" = "$ver" ] || { echo "tag v$tag doesn't match claude_pace.py --version ($ver)"; exit 1; }
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check --strict dist/*
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-package
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: [test, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Version from the tag
+        run: echo "VER=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-package
+          path: pkg/
+
+      - name: Build the release files
+        run: |
+          set -e
+          mkdir -p dist "stage/claude-pace-$VER"
+          chmod +x claude_pace.py install.sh
+          cp -p claude_pace.py install.sh install.ps1 README.md LICENSE "Claude Pace.bat" "stage/claude-pace-$VER/"
+          (cd stage && zip -r -X "../dist/claude-pace-$VER.zip" "claude-pace-$VER")
+          cp -p claude_pace.py install.sh install.ps1 pkg/* dist/
+          (cd dist && sha256sum claude_pace.py install.sh install.ps1 "claude-pace-$VER.zip" \
+            "claude_pace-$VER-py3-none-any.whl" "claude_pace-$VER.tar.gz" > SHA256SUMS)
+          cat dist/SHA256SUMS
+          # The installers read SHA256SUMS in this exact "hash  name" form.
+          grep -qE '^[0-9a-f]{64}  claude_pace\.py$' dist/SHA256SUMS
+
+      - name: Check the built installer works from the release files
+        run: |
+          set -e
+          (cd dist && python3 -m http.server 8765 >/dev/null 2>&1 &)
+          sleep 2
+          export HOME="$RUNNER_TEMP/release-home"
+          mkdir -p "$HOME"
+          CLAUDE_PACE_BASE_URL=http://127.0.0.1:8765 CLAUDE_PACE_NO_ACCOUNT=1 sh dist/install.sh --no-launcher
+          python3 "$HOME/.claude-pace/claude_pace.py" --version
+
+      - name: Publish
+        uses: softprops/action-gh-release@v3
+        with:
+          name: claude-pace v${{ env.VER }}
+          generate_release_notes: true
+          files: |
+            dist/claude_pace.py
+            dist/install.sh
+            dist/install.ps1
+            dist/claude-pace-${{ env.VER }}.zip
+            dist/claude_pace-${{ env.VER }}-py3-none-any.whl
+            dist/claude_pace-${{ env.VER }}.tar.gz
+            dist/SHA256SUMS
+
+  pypi:
+    # Trusted Publishing: PyPI trusts this workflow in this repo, so no token
+    # is stored anywhere. One-time setup on pypi.org: a trusted publisher for
+    # owner ElishaPervez, repo claude-pace, workflow release.yml, environment pypi.
+    needs: release
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/claude-pace/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-package
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

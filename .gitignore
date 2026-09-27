@@ -1,6 +1,15 @@
 # Personal usage data and logins live in ~/.claude, never here - but just in case:
 usage-latest.json
 usage-history.jsonl
-*.tmp
+usage-account.json
+claude-pace-config.json
+usage-tracker-config.json
+settings.json.bak-*
 .credentials.json
+*.tmp
 __pycache__/
+*.pyc
+/dist/
+*.egg-info/
+build/
+.venv/

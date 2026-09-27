@@ -1,0 +1,194 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.py }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        py: ['3.9', '3.12', '3.13']
+        exclude:
+          # Apple-silicon runners may not have a 3.9 build; the Python that
+          # ships with macOS (3.9) is tested instead - it's what most Mac
+          # users actually have.
+          - os: macos-latest
+            py: '3.9'
+          # GitHub's Python 3.9 builds stop at Ubuntu 24.04, so pin that
+          # rather than follow ubuntu-latest to a newer release.
+          - os: ubuntu-latest
+            py: '3.9'
+        include:
+          - os: macos-latest
+            py: system
+          - os: ubuntu-24.04
+            py: '3.9'
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REQUIRE_SHELLS: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v7
+
+      - if: matrix.py != 'system'
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.py }}
+
+      - name: Pick Python
+        run: |
+          if [ "${{ matrix.py }}" = system ]; then PY=/usr/bin/python3; else PY=$(command -v python); fi
+          # PowerShell steps need a Windows-style path.
+          if [ "$RUNNER_OS" = Windows ]; then PY=$(cygpath -w "$PY"); fi
+          "$PY" --version
+          "$PY" -c 'import sys; assert sys.version_info >= (3, 9), sys.version'
+          echo "PY=$PY" >> "$GITHUB_ENV"
+
+      - name: Compile
+        run: $PY -m py_compile claude_pace.py tools/simulate_sessions.py tests/*.py
+
+      - name: Version
+        run: $PY claude_pace.py --version
+
+      - name: Sessions-per-week accuracy (both sources)
+        run: $PY tests/check_sim.py both
+      - name: Sessions-per-week accuracy (status bar only)
+        run: $PY tests/check_sim.py bar
+      - name: Sessions-per-week accuracy (account only)
+        run: $PY tests/check_sim.py account
+
+      - name: Unit tests (render, status line, install)
+        run: $PY -m unittest discover -s tests -v
+
+      - name: Show a frame (for the log)
+        run: |
+          D=$(mktemp -d)
+          $PY tests/make_fixture.py "$D"
+          CLAUDE_CONFIG_DIR="$D" CLAUDE_PACE_DIR="$D" CLAUDE_PACE_NO_ACCOUNT=1 COLUMNS=100 LINES=45 NO_COLOR=1 \
+            $PY claude_pace.py --once
+
+      - name: Live dashboard quits on q (pseudo-terminal)
+        if: runner.os != 'Windows'
+        run: $PY tests/pty_smoke.py
+
+      - name: install.sh end to end
+        if: runner.os != 'Windows'
+        run: PY="$PY" sh tests/e2e_install.sh
+
+      - name: install.ps1 end to end (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\e2e_install.ps1 -Python "$env:PY"
+
+      - name: install.ps1 end to end (PowerShell 7)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/e2e_install.ps1 -Python "$env:PY"
+
+  package:
+    # The PyPI package: build it, install it into a fresh environment, and use
+    # the `claude-pace` command it provides - the way pipx / uv users get it.
+    name: package / ${{ matrix.os }} / Python ${{ matrix.py }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        py: ['3.13']
+        include:
+          - os: ubuntu-24.04   # see the test job: 3.9 builds stop at 24.04
+            py: '3.9'
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REQUIRE_SHELLS: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.py }}
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check --strict dist/*
+          ls -l dist
+
+      - name: Install the wheel into a fresh environment
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          if [ "$RUNNER_OS" = Windows ]; then BIN="$RUNNER_TEMP/venv/Scripts"; else BIN="$RUNNER_TEMP/venv/bin"; fi
+          "$BIN/python" -m pip install dist/*.whl
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+
+      - name: Use the installed command
+        run: |
+          set -e
+          H="$RUNNER_TEMP/pkg-home"
+          mkdir -p "$H/.claude"
+          if [ "$RUNNER_OS" = Windows ]; then W=$(cygpath -w "$H"); else W="$H"; fi
+          export HOME="$W" USERPROFILE="$W" CLAUDE_CONFIG_DIR="$W/.claude" CLAUDE_PACE_NO_ACCOUNT=1
+          cd "$RUNNER_TEMP"   # so the repo's own claude_pace.py can't be imported by accident
+          "$BIN/claude-pace" --version | grep -q '^claude-pace '
+          "$BIN/claude-pace" statusline < "$GITHUB_WORKSPACE/tests/fixtures/payload_full.json"
+          grep -q '"used_percentage"' "$H/.claude/usage-latest.json"
+          python "$GITHUB_WORKSPACE/tests/make_fixture.py" "$H/.claude"
+          COLUMNS=100 LINES=45 NO_COLOR=1 "$BIN/claude-pace" --once
+          "$BIN/claude-pace" install --no-launcher
+          cat "$H/.claude/settings.json"
+          grep -q 'claude-pace' "$H/.claude/settings.json"
+          python "$GITHUB_WORKSPACE/tests/run_status_command.py" "$H/.claude/settings.json" "$H/.claude"
+          "$BIN/claude-pace" uninstall
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: shellcheck
+        run: shellcheck install.sh tests/e2e_install.sh
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $r = foreach ($f in 'install.ps1', 'tests/e2e_install.ps1') {
+            Invoke-ScriptAnalyzer -Path $f -Severity Warning, Error `
+              -ExcludeRule PSAvoidUsingWriteHost, PSAvoidUsingInvokeExpression
+          }
+          $r | Format-Table -AutoSize | Out-String -Width 200
+          if ($r) { exit 1 }
+
+      - name: Line endings and encoding
+        run: |
+          bad=$(git ls-files '*.py' '*.sh' '*.command' '*.yml' '*.md' '*.json' | xargs -r grep -lI $'\r' || true)
+          if [ -n "$bad" ]; then echo "CRLF line endings in: $bad"; exit 1; fi
+          # PowerShell 5.1 reads files without a byte-order mark as the local
+          # code page, so the installer must stay plain ASCII.
+          if LC_ALL=C grep -n '[^[:print:][:space:]]' install.ps1; then echo "install.ps1 must be ASCII"; exit 1; fi
+
+      - name: Python fatal-error lint
+        run: pipx run ruff check --select E9,F63,F7,F82 --target-version py39 claude_pace.py tests
+
+      - name: Nothing personal in the repo
+        run: |
+          if git grep -nIE 'sk-ant-[A-Za-z0-9]|"accessToken" *: *"[^"]{20}|C:[\/]+Users[\/]+PC([\/"]|$)|/Users/P[C]/|skel[y]ton|yas[h]ua|weave[.]gl|@gmai[l][.]com'; then
+            echo "possible personal data or credentials above"; exit 1
+          fi

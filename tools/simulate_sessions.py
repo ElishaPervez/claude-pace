@@ -7,6 +7,9 @@ status bar rounds down and is one message behind - and checks the
 dashboard's estimate and its "likely" range against the truth.
 
     python tools/simulate_sessions.py [both|bar|account]
+
+Exits with an error if the true value lands inside the "likely" range in
+fewer than 95% of runs, or the median error is above 5%, so CI can run it.
 """
 import importlib.util as u
 import math
@@ -16,7 +19,7 @@ MODE = sys.argv[1] if len(sys.argv) > 1 else 'both'
 
 from pathlib import Path
 
-s = u.spec_from_file_location('cu', Path(__file__).resolve().parent.parent / 'claude-usage.py')
+s = u.spec_from_file_location('cu', Path(__file__).resolve().parent.parent / 'claude_pace.py')
 m = u.module_from_spec(s)
 s.loader.exec_module(m)
 
@@ -32,7 +35,7 @@ def simulate(seed, days, ratio):
     t, h, total = 0, 0.0, 0.0
     win_end = None
     samples, last_acct, last_bar = [], None, None
-    lag_h = lag_w = None
+    lag_h = lag_hr = lag_w = None
     active_until = 0
     window_open = True
     while t < days * 86400:
@@ -87,6 +90,9 @@ for seed in range(trials):
     if r['d7'] > 0:
         rough_errs.append(abs(r['d5'] / r['d7'] - ratio) / ratio)
 
+if not ready:
+    print('no simulated history reached the exact method')
+    sys.exit(1)
 errs.sort()
 rough_errs.sort()
 print(f'{ready} of {trials} simulated histories reached the exact method')
@@ -94,3 +100,7 @@ print(f'true value inside the "likely" range: {covered} of {ready} ({100 * cover
 print(f'tick-to-tick error: median {100 * errs[len(errs) // 2]:.1f}%, 90% of runs within {100 * errs[int(len(errs) * .9)]:.1f}%')
 print(f'old rough method error on the same histories: median {100 * rough_errs[len(rough_errs) // 2]:.1f}%, '
       f'90% within {100 * rough_errs[int(len(rough_errs) * .9)]:.1f}%')
+coverage, median = 100 * covered / ready, 100 * errs[len(errs) // 2]
+if coverage < 95 or median > 5:
+    print(f'FAIL ({MODE}): coverage {coverage:.0f}% (need >= 95%), median error {median:.1f}% (need <= 5%)')
+    sys.exit(1)
