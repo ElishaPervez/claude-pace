@@ -207,11 +207,40 @@ def tiles(used, total):
 
 # ── layout ────────────────────────────────────────────────────────────────
 
+# How squeezed the frame is, 0 (roomy) to 4 (tightest). render() tries each
+# level until the frame fits the window's height.
+#   1  no blank spacer lines
+#   2  one-line logo instead of the big one
+#   3  merged rows and shorter wording
+#   4  header folded into the logo line, least important details dropped
+LVL = 0
+NARROW = False  # window too narrow for dates and long wording; set by frame()
+
+TOKEN = re.compile(r'(\x1b\[[0-9;?]*[A-Za-z])|(.)', re.S)
+
+
+def clip(s, n):
+    """Cut s to n visible characters, ending in … if anything was cut."""
+    if vlen(s) <= n:
+        return s
+    out, count = [], 0
+    for m in TOKEN.finditer(s):
+        if m.group(1):
+            out.append(m.group(1))
+        elif count < n - 1:
+            out.append(m.group(2))
+            count += 1
+    return ''.join(out) + RESET + '…'
+
+
 def panel(title, rows, width):
     inner = width - 4
-    head = f'{paint("╭─", BORDER)} {paint(title, ACCENT, bold=True)} '
+    head = clip(f'{paint("╭─", BORDER)} {paint(title, ACCENT, bold=True)} ', width - 2)
     lines = [head + paint('─' * max(width - vlen(head) - 1, 0) + '╮', BORDER)]
     for r in rows:
+        if r == '' and LVL >= 1:
+            continue
+        r = clip(r, inner)
         lines.append(f'{paint("│", BORDER)} {r}{" " * max(inner - vlen(r), 0)} {paint("│", BORDER)}')
     lines.append(paint('╰' + '─' * (width - 2) + '╯', BORDER))
     return lines
@@ -332,21 +361,30 @@ def today_budget(week, samples, now):
 
 # ── panels ────────────────────────────────────────────────────────────────
 
+def reset_text(reset, now):
+    if reset is None:
+        return paint('reset time unknown', FAINT)
+    when = '' if NARROW else paint(' · ' + fmt_when(reset, now), MUTED)
+    return f'{paint("resets in", MUTED)} {paint(fmt_span(reset - now), TEXT)}{when}'
+
+
 def meter_rows(label, limit, inner, now, marker=None, marker_note=None):
+    name = paint(label, TEXT, bold=True)
     if not is_limit(limit):
-        return [paint(label, TEXT, bold=True), paint('no data yet', FAINT)]
+        return [spread(name, paint('no data yet', FAINT), inner)]
     reset = limit.get('resets_at') if is_num(limit.get('resets_at')) else None
     if reset is not None and reset <= now:
-        return [spread(paint(label, TEXT, bold=True), paint('0%', GREEN, bold=True), inner),
-                bar(0, inner), paint('Reset - shows 0% until your next Claude Code message', MUTED)]
+        return [spread(name, paint('0%', GREEN, bold=True), inner), bar(0, inner),
+                paint('Reset - shows 0% until your next Claude Code message', MUTED)]
     pct = limit['used_percentage']
-    rows = [spread(paint(label, TEXT, bold=True), paint(f'{fmt_num(pct)}%', level(pct), bold=True), inner),
-            bar(pct / 100, inner, marker=marker,
-                red_from=marker if marker is not None and pct / 100 > marker else None)]
-    reset_text = (f'resets in {paint(fmt_span(reset - now), TEXT)}{paint(" · " + fmt_when(reset, now), MUTED)}'
-                  if reset is not None else paint('reset time unknown', FAINT))
-    rows.append(spread(paint(marker_note, MUTED) if marker_note else '', paint(reset_text, MUTED), inner))
-    return rows
+    num = paint(f'{fmt_num(pct)}%', level(pct), bold=True)
+    b = bar(pct / 100, inner, marker=marker,
+            red_from=marker if marker is not None and pct / 100 > marker else None)
+    note = paint(marker_note, MUTED) if marker_note else ''
+    if LVL >= 3:  # label, %, note and reset on one line above the bar
+        left = f'{name} {num}' + (f'  {note}' if note else '')
+        return [spread(left, reset_text(reset, now), inner), b]
+    return [spread(name, num, inner), b, spread(note, reset_text(reset, now), inner)]
 
 
 def limits_panel(data, today, width, now):
@@ -355,8 +393,8 @@ def limits_panel(data, today, width, now):
     if today['state'] == 'ok':
         stop = min(today['base'] + today['allowance'], 100)
         marker = stop / 100
-        note = f'┃ stop here today: {fmt_pct(stop)}%'
-    rows = meter_rows('5-hour session', data.get('five_hour'), inner, now)
+        note = f'┃ stop at {fmt_pct(stop)}%' if LVL >= 3 else f'┃ stop here today: {fmt_pct(stop)}%'
+    rows = meter_rows('5-hour session' if LVL < 3 else '5-hour', data.get('five_hour'), inner, now)
     rows.append('')
     rows += meter_rows('Week', data.get('seven_day'), inner, now, marker, note)
     return panel('Limits', rows, width)
@@ -364,6 +402,7 @@ def limits_panel(data, today, width, now):
 
 def today_panel(t, m, width, now):
     inner = width - 4
+    tight = LVL >= 3 or inner < 72 or NARROW
     if t['state'] == 'none':
         return panel("Today's budget", [paint('No weekly numbers yet.', MUTED)], width)
     if t['state'] == 'reset':
@@ -371,25 +410,31 @@ def today_panel(t, m, width, now):
                                             'Claude Code message.', inner), width)
 
     def sessions(pct):
-        return paint(f'≈ {fmt_num(pct * m["d5"] / m["d7"] / 100)} full 5-hour sessions', MUTED) if ratio_ready(m) else ''
+        if not ratio_ready(m):
+            return ''
+        n = fmt_num(pct * m['d5'] / m['d7'] / 100)
+        return paint(f'≈ {n} sessions' if tight else f'≈ {n} full 5-hour sessions', MUTED)
 
     a, used, left = t['allowance'], t['used'], t['left']
-    rows = [spread(f'{paint("Allowance", MUTED)}  {paint(fmt_pct(a) + "%", TEXT, bold=True)} '
-                   f'{paint("of the week", MUTED)}', sessions(a), inner)]
+    allow_txt = f'{paint("Allowance", MUTED)} {paint(fmt_pct(a) + "%", TEXT, bold=True)}'
+    used_txt = f'{paint("Used", MUTED)} {paint(fmt_pct(used) + "%", TEXT, bold=True)}'
+    if left >= 0:
+        rest = f'{paint("Left", MUTED)} {paint(fmt_pct(left) + "%", GREEN, bold=True)}'
+    else:
+        rest = paint('OVER by ' + fmt_pct(-left) + '%', RED, bold=True)
 
     # Full bar = today's allowance (or today's use, if that's bigger). Green up
     # to the allowance, red past it, bright tick where the allowance ends.
     scale = max(a, used, 0.001)
     over = used > a
-    rows.append(bar(used / scale, inner, color=GREEN, red_from=(a / scale) if over else None,
-                    marker=(a / scale) if over else None))
+    b = bar(used / scale, inner, color=GREEN, red_from=(a / scale) if over else None,
+            marker=(a / scale) if over else None)
 
-    used_txt = f'{paint("Used", MUTED)} {paint(fmt_pct(used) + "%", TEXT, bold=True)}'
-    if left >= 0:
-        rest = f'{paint("Left", MUTED)} {paint(fmt_pct(left) + "%", GREEN, bold=True)}'
-        rows.append(spread(f'{used_txt}   {rest}', sessions(left), inner))
+    if LVL >= 4:
+        rows = [spread(f'{allow_txt}   {used_txt}   {rest}', sessions(max(left, 0)), inner), b]
     else:
-        rows.append(f'{used_txt}   {paint("OVER by " + fmt_pct(-left) + "%", RED, bold=True)}')
+        rows = [spread(f'{allow_txt} {paint("of the week", MUTED)}', sessions(a), inner), b,
+                spread(f'{used_txt}   {rest}', sessions(left) if left >= 0 else '', inner)]
 
     rows.append('')
     if t['next'] is not None:
@@ -397,27 +442,36 @@ def today_panel(t, m, width, now):
         if abs(change) < 0.05:
             trend = paint('same as today', MUTED)
         elif change > 0:
-            trend = paint(f'▲ {fmt_pct(change)}% more than today', GREEN)
+            trend = paint(f'▲ {fmt_pct(change)}%' + ('' if tight else ' more than today'), GREEN)
         else:
-            trend = paint(f'▼ {fmt_pct(-change)}% less than today', RED)
-        rows.append(f'{paint("If you stop now, each remaining day gets", MUTED)} '
-                    f'{paint(fmt_pct(t["next"]) + "%", TEXT, bold=True)}  {trend}')
+            trend = paint(f'▼ {fmt_pct(-change)}%' + ('' if tight else ' less than today'), RED)
+        lead = 'Stop now → each later day gets' if tight else 'If you stop now, each remaining day gets'
+        rows.append(f'{paint(lead, MUTED)} {paint(fmt_pct(t["next"]) + "%", TEXT, bold=True)}  {trend}')
     else:
         rows.append(paint('Last day before the reset - everything left is yours to use.', MUTED))
 
     dots = ' '.join(paint('●', FAINT) if i < t['idx'] else paint('◉', ACCENT) if i == t['idx']
                     else paint('○', MUTED) for i in range(7))
     left_days = t['days_left']
-    rows.append(f'{dots}   {paint(f"Day {t['idx'] + 1} of 7", TEXT)}'
-                f'{paint(f" · {left_days} day{'s' if left_days != 1 else ''} left", MUTED)}')
+    day = f'{dots}  {paint(f"Day {t['idx'] + 1}" + ("/7" if NARROW else " of 7"), TEXT)}'
     what = 'New daily budget' if left_days > 1 else 'Week resets'
-    rows.append(f'{paint(what, MUTED)} {paint("in " + fmt_span(t["day_end"] - now), TEXT, bold=True)}'
-                f'{paint(" · " + fmt_when(t["day_end"], now), MUTED)}')
+    countdown = paint('in ' + fmt_span(t['day_end'] - now), TEXT, bold=True)
+    if not (tight and NARROW):
+        countdown += paint(' · ' + fmt_when(t['day_end'], now), MUTED)
+    if tight:
+        rows.append(f'{day} {paint("· new budget" if left_days > 1 else "· week resets", MUTED)} {countdown}')
+    else:
+        rows.append(day + paint(f" · {left_days} day{'s' if left_days != 1 else ''} left", MUTED))
+        rows.append(f'{paint(what, MUTED)} {countdown}')
     if t['partial_from'] is not None:
         rows.append('')
-        rows += [paint('⚠ ', AMBER) + line if i == 0 else '  ' + line for i, line in enumerate(
-            wrap(f'Partial day - tracking started {fmt_time(t["partial_from"])}; usage before that '
-                 "isn't counted as today's.", inner - 2, AMBER))]
+        since = fmt_time(t['partial_from'])
+        if tight:
+            rows.append(paint('! ', AMBER, bold=True) + paint(f'Partial day - only counting since {since}', AMBER))
+        else:
+            rows += [paint('! ', AMBER, bold=True) + line if i == 0 else '  ' + line for i, line in enumerate(
+                wrap(f'Partial day - tracking started {since}; usage before that '
+                     "isn't counted as today's.", inner - 2, AMBER))]
     clock = fmt_time(t['day_end'])
     return panel(f"Today's budget  {paint(f'{clock} → {clock}', MUTED)}", rows, width)
 
@@ -431,13 +485,15 @@ def sessions_panel(m, week, width):
     seen = (f'Seen so far: {fmt_num(m["d5"])}% of 5-hour usage moved the week {fmt_num(m["d7"])}% · '
             f'{m["windows"]} window{"s" if m["windows"] != 1 else ""} · since {fmt_date(m["since"])}')
     if not ratio_ready(m):
-        half = (inner - 26) // 2
-        rows = [paint('Still measuring', AMBER, bold=True) + paint(' - the estimate appears once both bars fill.', MUTED), '',
-                spread(paint('5-hour usage seen', MUTED), paint(f'{fmt_num(m["d5"])} / {MIN_SESSION_PTS}%', TEXT), 26)
-                + ' ' + bar(m['d5'] / MIN_SESSION_PTS, half, color=ACCENT),
-                spread(paint('Weekly usage seen', MUTED), paint(f'{fmt_num(m["d7"])} / {MIN_WEEK_PTS}%', TEXT), 26)
-                + ' ' + bar(m['d7'] / MIN_WEEK_PTS, half, color=ACCENT)]
-        return panel(title, rows, width)
+        half = max((inner - 26) // 2, 8)
+        rows = [] if LVL >= 4 else [
+            paint('Still measuring', AMBER, bold=True)
+            + ('' if NARROW else paint(' - the estimate appears once both bars fill.', MUTED)), '']
+        rows += [spread(paint('5-hour usage seen', MUTED), paint(f'{fmt_num(m["d5"])} / {MIN_SESSION_PTS}%', TEXT), 26)
+                 + ' ' + bar(m['d5'] / MIN_SESSION_PTS, half, color=ACCENT),
+                 spread(paint('Weekly usage seen', MUTED), paint(f'{fmt_num(m["d7"])} / {MIN_WEEK_PTS}%', TEXT), 26)
+                 + ' ' + bar(m['d7'] / MIN_WEEK_PTS, half, color=ACCENT)]
+        return panel(title + (' - still measuring' if LVL >= 4 else ''), rows, width)
 
     sessions = m['d5'] / m['d7']
     lo = (m['d5'] - m['err']) / (m['d7'] + m['err'])
@@ -445,7 +501,7 @@ def sessions_panel(m, week, width):
     rng = f'likely {fmt_num(lo)}–{fmt_num(hi)}' if hi is not None else f'at least {fmt_num(lo)}'
     rows = [spread(f'{paint("≈ " + fmt_num(sessions), ACCENT, bold=True)} '
                    f'{paint("full 5-hour sessions fill the week", TEXT)}', paint(rng, MUTED), inner)]
-    if is_limit(week):
+    if is_limit(week) and LVL < 4:
         used_sessions = week['used_percentage'] * m['d5'] / m['d7'] / 100
         rows.append('')
         rows.append(f'{tiles(used_sessions, sessions)}  '
@@ -455,9 +511,9 @@ def sessions_panel(m, week, width):
                 f'{paint("of a 5-hour session", MUTED)}   {paint("·", FAINT)}   '
                 f'{paint("1 session", MUTED)} ≈ {paint(fmt_num(100 * m["d7"] / m["d5"]) + "%", TEXT, bold=True)} '
                 f'{paint("of the week", MUTED)}')
-    rows += wrap(seen, inner, FAINT)
+    if LVL < 3:
+        rows += wrap(seen, inner, FAINT)
     return panel(title, rows, width)
-
 
 
 # ── banner ────────────────────────────────────────────────────────────────
@@ -512,6 +568,7 @@ def banner_line(text, width):
 
 
 def banner_width(text):
+    text = [ch for ch in text.upper() if ch in GLYPHS]
     return sum(len(GLYPHS[ch][0]) for ch in text) + len(text) - 1
 
 
@@ -577,12 +634,13 @@ def plan_loop():
         refresh_plan()
 
 
-def plan_lines(width):
+def plan_info():
+    """(banner text, subtitle, subtitle colour) for the signed-in plan."""
     name = PLAN.get('name')
     if not name:
         why = {'none': 'Not signed in to Claude Code',
                None: 'Plan unknown'}.get(PLAN.get('method'), 'Claude Code is not signed in with a Claude plan')
-        return banner('CLAUDE', width) + [paint(why.center(width).rstrip(), FAINT)]
+        return 'CLAUDE', why, FAINT
     label = PLAN_NAMES.get(name.lower(), name.title())
     tier = PLAN.get('tier')
     if not tier:
@@ -591,7 +649,26 @@ def plan_lines(width):
         sub = f'{tier} plan'
     else:
         sub = f'{label} plan · {tier} usage limits'
-    return banner(f'CLAUDE {label}', width) + [paint(sub.center(width).rstrip(), MUTED)]
+    return f'CLAUDE {label}', sub, MUTED
+
+
+def small_logo(text):
+    """The logo on one line: spaced-out letters in the same orange gradient."""
+    chars = '  '.join(' '.join(word) for word in text.upper().split())
+    n = max(len(chars) - 1, 1)
+    return ''.join(paint(ch, mix(BANNER_FROM, BANNER_TO, i / n), bold=True) if ch != ' ' else ' '
+                   for i, ch in enumerate(chars))
+
+
+def plan_lines(width):
+    text, sub, color = plan_info()
+    big_fits = all(banner_width(w) <= width for w in text.split())
+    if LVL <= 1 and big_fits:
+        return banner(text, width) + [paint(sub.center(width).rstrip(), color)]
+    line = f'{paint("✻", ACCENT, bold=True)} {small_logo(text)} {paint("✻", ACCENT, bold=True)}'
+    if vlen(line) + 3 + len(sub) <= width:
+        line += '   ' + paint(sub, color)
+    return [' ' * max((width - vlen(line)) // 2, 0) + line]
 
 
 def load(now):
@@ -623,21 +700,25 @@ def load(now):
     return 'LIVE', GREEN, None, data
 
 
-def frame(now):
-    cols = shutil.get_terminal_size((100, 40)).columns
-    width = min(max(cols - 2, 66), 92)
-    inner = width - 4
+def frame(now, cols):
+    global NARROW
+    width = min(max(cols - 2, 44), 92)
+    NARROW = width < 68
     status, scol, message, data = load(now)
 
     pill = paint(('✖ ' if scol == RED else '● ') + status, scol, bold=True)
-    head = spread(f' {paint("✻", ACCENT, bold=True)} {paint("CLAUDE USAGE", TEXT, bold=True)}',
-                  f'{pill}   {paint(fmt_time(now), MUTED)} ', width)
-    out = ['', head, ''] + plan_lines(width) + ['']
+    right = f'{pill}   {paint(fmt_time(now), MUTED)} '
+    if LVL >= 4:  # header and logo share one line
+        text, _, _ = plan_info()
+        out = [spread(f' {paint("✻", ACCENT, bold=True)} {small_logo(text)}', right, width)]
+    else:
+        head = spread(f' {paint("✻", ACCENT, bold=True)} {paint("CLAUDE USAGE", TEXT, bold=True)}', right, width)
+        out = ['', head, ''] + plan_lines(width) + ['']
     if message:
         out += [' ' + line for line in wrap(message, width - 2, scol if scol == RED else MUTED)]
         out.append('')
     if data is None:
-        return out
+        return out, width
 
     samples = read_history()
     m = session_math(samples)
@@ -648,22 +729,43 @@ def frame(now):
 
     saved = data['saved_at']
     info = f'Updated {fmt_time(saved)} ({fmt_ago(now - saved)})'
-    if m['since']:
+    if m['since'] and LVL < 3 and not NARROW:
         info += (f' · saved log: {m["count"]} reading{"s" if m["count"] != 1 else ""} since '
                  f'{fmt_date(m["since"])}, {fmt_time(m["since"])}')
-    out += [' ' + line for line in wrap(info, width - 2, FAINT)]
-    return out
+    out.append(' ' + paint(info, FAINT))
+    return out, width
 
 
-def render(now=None):
+def keys_line(now):
+    if NARROW:
+        return f' {paint("R", TEXT, bold=True)} {paint("refresh", MUTED)}  {paint("Q", TEXT, bold=True)} {paint("quit", MUTED)}'
+    return (f' {paint("R", TEXT, bold=True)} {paint("refresh", MUTED)}   {paint("Q", TEXT, bold=True)} '
+            f'{paint("quit", MUTED)}   {paint(f"auto-refresh every {REFRESH_S}s · checked {fmt_time(now)}", FAINT)}')
+
+
+def render(now=None, size=None):
+    """The frame as a list of lines, squeezed until it fits the window."""
+    global LVL
     now = time.time() if now is None else now
+    cols, rows = size or shutil.get_terminal_size((100, 40))
     try:
-        lines = frame(now)
+        for LVL in range(5):
+            lines, width = frame(now, cols)
+            if LVL >= 3:  # "Updated ..." and the keys share one line
+                lines[-1] = spread(lines[-1], keys_line(now).lstrip(), width)
+            else:
+                lines += ['', keys_line(now)]
+            if LVL >= 1:
+                lines = [line for line in lines if line != '']
+            if len(lines) <= rows:
+                break
     except Exception as e:  # never die on a bad frame - show it and keep running
         lines = ['', paint(f' ✖ WINDOW ERROR  {e}', RED, bold=True), paint(' Still running - press R to try again.', MUTED)]
-    keys = (f' {paint("R", TEXT, bold=True)} {paint("refresh", MUTED)}   {paint("Q", TEXT, bold=True)} '
-            f'{paint("quit", MUTED)}   {paint(f"auto-refresh every {REFRESH_S}s · checked {fmt_time(now)}", FAINT)}')
-    return lines + ['', keys]
+    finally:
+        LVL = 0
+    # Never wider or taller than the window: overflow would scroll the top
+    # (the logo) off screen.
+    return [clip(line, cols) for line in lines[:rows]]
 
 
 def enable_vt():
@@ -701,7 +803,7 @@ def main():
         while True:
             size = shutil.get_terminal_size()
             if time.time() - last >= REFRESH_S or size != last_size:
-                w('\x1b[H' + '\n'.join(line + '\x1b[K' for line in render()) + '\x1b[J')
+                w('\x1b[H' + '\n'.join(line + '\x1b[K' for line in render(size=size)) + '\x1b[J')
                 sys.stdout.flush()
                 last, last_size = time.time(), size
             if msvcrt and msvcrt.kbhit():
