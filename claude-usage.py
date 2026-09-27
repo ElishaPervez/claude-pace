@@ -7,15 +7,20 @@ Reads two files that the Claude Code status bar (statusline.js) writes into
 your Claude folder (~/.claude) every time a session refreshes:
   usage-latest.json    latest 5-hour and weekly percentages + reset times
   usage-history.jsonl  one line each time either number changes, kept forever
-When the status bar has been quiet for 2 minutes (you're in the desktop app,
-on claude.ai, or just idle), the dashboard asks your Claude account for the
-same two numbers directly, every 2 minutes while it's open, and saves them to
-the same files. That uses the login Claude Code saved in your Claude folder
-and sends it only to Anthropic. Turn it off with --no-account.
+
+While it's open, the dashboard also asks your Claude account for the same two
+numbers every 2 minutes and shows those: they're current even when you're in
+the desktop app or on claude.ai, and the status bar's copy runs about a point
+behind. They're saved to usage-account.json and the same history log. That
+uses the login Claude Code saved in your Claude folder and sends it only to
+Anthropic. If the account can't be reached, the status bar's numbers are
+used. Turn it off with --no-account.
 
 The plan name in the banner comes from asking Claude Code
-(`claude auth status`) at startup and every 10 minutes. Nothing is kept in memory between runs - every frame is
-worked out from those files, so restarts lose nothing.
+(`claude auth status`) at startup and every 10 minutes.
+
+Nothing is kept in memory between runs - every frame is worked out from those
+files, so restarts lose nothing.
 
 Keys: R = re-read now, Q / Esc / Ctrl+C = quit. Re-reads every 30 s.
 Flags: --once        print one frame and exit (no account check)
@@ -47,10 +52,13 @@ CONFIG_DIR = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude'
 DATA_DIR = Path(os.environ.get('CLAUDE_USAGE_DIR') or CONFIG_DIR)
 LATEST = DATA_DIR / 'usage-latest.json'
 HISTORY = DATA_DIR / 'usage-history.jsonl'
+ACCOUNT_FILE = DATA_DIR / 'usage-account.json'
 
 REFRESH_S = 30
 PLAN_REFRESH_S = 600
-ACCOUNT_EVERY_S = 120  # ask the account this often, once the status bar is this quiet
+ACCOUNT_EVERY_S = 120  # ask the account this often while the dashboard is open
+ACCOUNT_FRESH_S = 2 * ACCOUNT_EVERY_S + 60  # account numbers younger than this win
+SOURCE_SLACK = 1  # the status bar can read up to this many points below the account
 STALE_S = 30 * 60
 MIN_SESSION_PTS = 25   # 5-hour points needed before the sessions-per-week ratio is shown
 MIN_WEEK_PTS = 3       # weekly points needed for the same
@@ -295,27 +303,38 @@ def session_math(samples):
     the week one 5-hour point costs. claude.ai usage between readings moves
     both meters, so it still counts correctly.
 
-    Meters are whole percentages, so each unbroken run of readings can be off
-    by up to 1 point per meter; err carries that into the shown range."""
-    d5 = d7 = 0.0
-    runs, in_run, whole = 0, False, True
+    Readings come from the status bar and from the account, and the status
+    bar can read a point lower, so a drop of up to SOURCE_SLACK isn't taken as
+    a reset. Rises add up to (last - first) of each unbroken run, so only a
+    run's two ends carry error: up to 1 point per meter when both ends come
+    from one source (whole percentages), 1.5 when they mix. err carries that
+    into the shown range."""
+    d5 = d7 = err = 0.0
+    in_run, whole, srcs = False, True, set()
     windows = set()
+
+    def close_run():
+        return (1 if len(srcs) <= 1 else 1.5) if in_run else 0
+
     for a, b in zip(samples, samples[1:]):
-        same = (abs(b['hr'] - a['hr']) < SAME_WINDOW_S and b['h'] >= a['h'] and
-                abs(b['wr'] - a['wr']) < SAME_WINDOW_S and b['w'] >= a['w'])
+        same = (abs(b['hr'] - a['hr']) < SAME_WINDOW_S and b['h'] >= a['h'] - SOURCE_SLACK and
+                abs(b['wr'] - a['wr']) < SAME_WINDOW_S and b['w'] >= a['w'] - SOURCE_SLACK)
         if not same:
+            err += close_run()
             in_run = False
             continue
         if not in_run:
-            runs, in_run = runs + 1, True
+            in_run, srcs = True, {a.get('src')}
+        srcs.add(b.get('src'))
         d5 += b['h'] - a['h']
         d7 += b['w'] - a['w']
         if b['h'] > a['h']:
             windows.add(round(b['hr'] / SAME_WINDOW_S))
         if any(float(x) != int(x) for x in (a['h'], b['h'], a['w'], b['w'])):
             whole = False
+    err += close_run()
     return {
-        'd5': d5, 'd7': d7, 'err': runs if whole else 0, 'windows': len(windows),
+        'd5': d5, 'd7': d7, 'err': err if whole else 0, 'windows': len(windows),
         'weeks': len({round(s['wr'] / SAME_WINDOW_S) for s in samples}),
         'since': samples[0]['t'] if samples else None, 'count': len(samples),
     }
@@ -700,17 +719,17 @@ def whole(v):
 
 
 def save_reading(five, week, now):
-    """Save account numbers exactly the way the status bar does: latest file
-    replaced in one step, and one history line if either number changed."""
+    """Save account numbers to their own file (so they never fight the status
+    bar's copy), and add a history line if either number changed since the
+    last account reading."""
     try:
-        prev = json.loads(LATEST.read_text(encoding='utf-8'))
+        prev = json.loads(ACCOUNT_FILE.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         prev = {}
     if not isinstance(prev, dict):
         prev = {}
     now = int(now)
-    nxt = {'saved_at': now, 'five_hour': five, 'seven_day': week,
-           'last_check': {'at': now, 'ok': True}, 'source': 'account'}
+    nxt = {'saved_at': now, 'five_hour': five, 'seven_day': week, 'source': 'account'}
 
     def key(l):
         return f"{l.get('used_percentage')}|{round((l.get('resets_at') or 0) / 60)}" if isinstance(l, dict) else '-'
@@ -719,12 +738,12 @@ def save_reading(five, week, now):
     if not unchanged or not HISTORY.exists():
         f, w = five or {}, week or {}
         line = {'t': now, 'h': f.get('used_percentage'), 'hr': f.get('resets_at'),
-                'w': w.get('used_percentage'), 'wr': w.get('resets_at')}
+                'w': w.get('used_percentage'), 'wr': w.get('resets_at'), 'src': 'account'}
         with HISTORY.open('a', encoding='utf-8', newline='\n') as fh:
             fh.write(json.dumps(line, separators=(',', ':')) + '\n')
-    tmp = LATEST.with_name(f'{LATEST.name}.{os.getpid()}.tmp')
+    tmp = ACCOUNT_FILE.with_name(f'{ACCOUNT_FILE.name}.{os.getpid()}.tmp')
     tmp.write_text(json.dumps(nxt, separators=(',', ':')), encoding='utf-8')
-    os.replace(tmp, LATEST)
+    os.replace(tmp, ACCOUNT_FILE)
 
 
 def fetch_account(now):
@@ -777,25 +796,14 @@ def fetch_account(now):
     ACCOUNT.update(ok=True, why=None)
 
 
-def saved_at():
-    try:
-        v = json.loads(LATEST.read_text(encoding='utf-8')).get('saved_at')
-        return v if is_num(v) else None
-    except (OSError, ValueError, AttributeError):
-        return None
-
-
 def account_loop():
-    """While the status bar is quiet, ask the account every ACCOUNT_EVERY_S."""
+    """Ask the account every ACCOUNT_EVERY_S while the dashboard is open."""
     while True:
         now = time.time()
-        last = saved_at()
-        quiet = last is None or now - last >= ACCOUNT_EVERY_S
-        due = ACCOUNT['tried'] is None or now - ACCOUNT['tried'] >= ACCOUNT_EVERY_S
-        if quiet and due:
+        if ACCOUNT['tried'] is None or now - ACCOUNT['tried'] >= ACCOUNT_EVERY_S:
             fetch_account(now)
             REDRAW.set()
-        time.sleep(10)
+        time.sleep(5)
 
 
 # ── frame ─────────────────────────────────────────────────────────────────
@@ -809,38 +817,61 @@ def failure_text(check):
             'may have changed how it reports them.')
 
 
-def load(now):
-    """Returns (status, status_colour, message, data)."""
+def read_json(path):
+    """(dict or None, what went wrong or None)."""
     try:
-        raw = LATEST.read_text(encoding='utf-8')
+        raw = path.read_text(encoding='utf-8')
     except FileNotFoundError:
-        return 'WAITING', AMBER, 'Send any message in Claude Code once to start the feed.', None
+        return None, None
     except OSError as e:
-        return "CAN'T READ", RED, f"The saved usage file couldn't be opened ({e.strerror or e}).", None
+        return None, f"couldn't be opened ({e.strerror or e})"
     try:
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError
+        d = json.loads(raw)
+        if isinstance(d, dict):
+            return d, None
     except ValueError:
-        return "CAN'T READ", RED, 'The saved usage file is damaged. It will fix itself on your next Claude Code message.', None
+        pass
+    return None, 'is damaged'
 
-    has = is_num(data.get('saved_at')) and (is_limit(data.get('five_hour')) or is_limit(data.get('seven_day')))
-    check = data.get('last_check') if isinstance(data.get('last_check'), dict) else {}
-    failing = check.get('ok') is False and is_num(check.get('at')) and (not has or check['at'] >= data['saved_at'])
+
+def has_numbers(d):
+    return (isinstance(d, dict) and is_num(d.get('saved_at')) and
+            (is_limit(d.get('five_hour')) or is_limit(d.get('seven_day'))))
+
+
+def load(now):
+    """Returns (status, status_colour, message, data). Fresh account numbers
+    win; otherwise the newest of the account's and the status bar's."""
+    acct = read_json(ACCOUNT_FILE)[0] if USE_ACCOUNT else None
+    acct = acct if has_numbers(acct) else None
+    if acct and now - acct['saved_at'] <= ACCOUNT_FRESH_S:
+        return 'LIVE', GREEN, None, acct
+
+    data, err = read_json(LATEST)
+    if data is None and acct is None:
+        if err:
+            return "CAN'T READ", RED, f'The saved usage file {err}. It will fix itself on your next Claude Code message.', None
+        return 'WAITING', AMBER, 'Send any message in Claude Code once to start the feed.', None
+
+    bar = data if has_numbers(data) else None
+    best = max((d for d in (bar, acct) if d), key=lambda d: d['saved_at'], default=None)
+    check = data.get('last_check') if data and isinstance(data.get('last_check'), dict) else {}
+    failing = (check.get('ok') is False and is_num(check.get('at')) and
+               (best is None or check['at'] >= best['saved_at']))
     if failing:
-        tail = ' Last good numbers shown below.' if has else ' No good numbers have been saved yet.'
-        return 'NOT UPDATING', RED, failure_text(check) + tail, data if has else None
-    if not has:
+        tail = ' Last good numbers shown below.' if best else ' No good numbers have been saved yet.'
+        return 'NOT UPDATING', RED, failure_text(check) + tail, best
+    if best is None:
         return "CAN'T READ", RED, 'The saved usage file has no usable numbers. It will fix itself on your next Claude Code message.', None
-    age = now - data['saved_at']
+    age = now - best['saved_at']
     if USE_ACCOUNT and ACCOUNT['ok'] is False and age > 2 * ACCOUNT_EVERY_S:
-        return ('IDLE', AMBER, f'No new numbers since {fmt_time(data["saved_at"])}. Checking your account '
-                f'directly failed: {ACCOUNT_WHY.get(ACCOUNT["why"], ACCOUNT["why"])}.', data)
+        return ('IDLE', AMBER, f'No new numbers since {fmt_time(best["saved_at"])}. Checking your account '
+                f'directly failed: {ACCOUNT_WHY.get(ACCOUNT["why"], ACCOUNT["why"])}.', best)
     if age > STALE_S:
         tail = ("If you've used the desktop app or claude.ai since then, these numbers are behind."
                 if not USE_ACCOUNT else 'Checking your account directly...')
-        return 'IDLE', AMBER, f'No Claude Code activity since {fmt_time(data["saved_at"])}. {tail}', data
-    return 'LIVE', GREEN, None, data
+        return 'IDLE', AMBER, f'No Claude Code activity since {fmt_time(best["saved_at"])}. {tail}', best
+    return 'LIVE', GREEN, None, best
 
 
 def frame(now, cols):

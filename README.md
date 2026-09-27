@@ -30,20 +30,23 @@ status bar and saves the numbers into your Claude folder (`~/.claude`):
 | --- | --- |
 | `usage-latest.json` | The latest 5-hour and weekly percentages and reset times |
 | `usage-history.jsonl` | One line every time either number changes - the permanent log |
+| `usage-account.json` | The latest numbers from your account (written by the dashboard) |
 
 `claude-usage.py` reads those two files and draws the dashboard, re-reading
 every 30 seconds. It keeps nothing in memory, so closing it or rebooting loses
 nothing. The numbers move when any Claude Code session sends a message; see
 below for the desktop app and claude.ai.
 
-### Desktop app and claude.ai
+### Account check (desktop app, claude.ai, and the status bar's lag)
 
 The status line is a terminal feature, so usage in the Claude desktop app or
-on claude.ai doesn't send new numbers by itself. To cover that, whenever the
-status line has been quiet for 2 minutes, the dashboard asks your Claude
-account for the same two numbers directly - every 2 minutes, only while the
-dashboard is open - and saves them to the same files (the footer then says
-"from your account").
+on claude.ai doesn't send new numbers by itself - and even in the terminal,
+the status line's copy of the numbers runs about a point behind your account.
+So while the dashboard is open, it asks your Claude account for the two
+numbers every 2 minutes and shows those (the footer says "from your
+account"). They're saved to `usage-account.json` and added to the same
+history log; the status line's numbers are used whenever the account can't
+be reached or the dashboard wasn't open.
 
 This uses the login key Claude Code saved in `~/.claude/.credentials.json`
 and sends it only to Anthropic, the same way Claude Code's usage screen does.
