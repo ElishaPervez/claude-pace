@@ -7,13 +7,19 @@ Reads two files that the Claude Code status bar (statusline.js) writes into
 your Claude folder (~/.claude) every time a session refreshes:
   usage-latest.json    latest 5-hour and weekly percentages + reset times
   usage-history.jsonl  one line each time either number changes, kept forever
-Never contacts Anthropic, so numbers only move when a Claude Code session
-sends a message. The plan name in the banner comes from asking Claude Code
+When the status bar has been quiet for 2 minutes (you're in the desktop app,
+on claude.ai, or just idle), the dashboard asks your Claude account for the
+same two numbers directly, every 2 minutes while it's open, and saves them to
+the same files. That uses the login Claude Code saved in your Claude folder
+and sends it only to Anthropic. Turn it off with --no-account.
+
+The plan name in the banner comes from asking Claude Code
 (`claude auth status`) at startup and every 10 minutes. Nothing is kept in memory between runs - every frame is
 worked out from those files, so restarts lose nothing.
 
 Keys: R = re-read now, Q / Esc / Ctrl+C = quit. Re-reads every 30 s.
-Flags: --once  print one frame and exit.
+Flags: --once        print one frame and exit (no account check)
+       --no-account  never ask your account directly; status bar only
 Env:   CLAUDE_CONFIG_DIR  your Claude folder, if it isn't ~/.claude
        CLAUDE_USAGE_DIR   read the usage files from another folder (for testing)
 """
@@ -27,6 +33,8 @@ import sys
 import textwrap
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -42,6 +50,7 @@ HISTORY = DATA_DIR / 'usage-history.jsonl'
 
 REFRESH_S = 30
 PLAN_REFRESH_S = 600
+ACCOUNT_EVERY_S = 120  # ask the account this often, once the status bar is this quiet
 STALE_S = 30 * 60
 MIN_SESSION_PTS = 25   # 5-hour points needed before the sessions-per-week ratio is shown
 MIN_WEEK_PTS = 3       # weekly points needed for the same
@@ -671,6 +680,135 @@ def plan_lines(width):
     return [' ' * max((width - vlen(line)) // 2, 0) + line]
 
 
+# ── account backup ────────────────────────────────────────────────────────
+
+ACCOUNT_URL = 'https://api.anthropic.com/api/oauth/usage'
+USE_ACCOUNT = '--no-account' not in sys.argv and not os.environ.get('CLAUDE_USAGE_NO_ACCOUNT')
+ACCOUNT = {'tried': None, 'ok': None, 'why': None}
+REDRAW = threading.Event()
+
+ACCOUNT_WHY = {
+    'no_login': 'no Claude Code login found on this PC',
+    'expired': 'the saved login has expired - send one message in Claude Code in a terminal to renew it',
+    'offline': "couldn't reach Anthropic - offline?",
+    'changed': "Anthropic's answer has changed - this backup needs an update",
+}
+
+
+def whole(v):
+    return int(v) if isinstance(v, float) and v.is_integer() else v
+
+
+def save_reading(five, week, now):
+    """Save account numbers exactly the way the status bar does: latest file
+    replaced in one step, and one history line if either number changed."""
+    try:
+        prev = json.loads(LATEST.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        prev = {}
+    if not isinstance(prev, dict):
+        prev = {}
+    now = int(now)
+    nxt = {'saved_at': now, 'five_hour': five, 'seven_day': week,
+           'last_check': {'at': now, 'ok': True}, 'source': 'account'}
+
+    def key(l):
+        return f"{l.get('used_percentage')}|{round((l.get('resets_at') or 0) / 60)}" if isinstance(l, dict) else '-'
+
+    unchanged = key(prev.get('five_hour')) == key(five) and key(prev.get('seven_day')) == key(week)
+    if not unchanged or not HISTORY.exists():
+        f, w = five or {}, week or {}
+        line = {'t': now, 'h': f.get('used_percentage'), 'hr': f.get('resets_at'),
+                'w': w.get('used_percentage'), 'wr': w.get('resets_at')}
+        with HISTORY.open('a', encoding='utf-8', newline='\n') as fh:
+            fh.write(json.dumps(line, separators=(',', ':')) + '\n')
+    tmp = LATEST.with_name(f'{LATEST.name}.{os.getpid()}.tmp')
+    tmp.write_text(json.dumps(nxt, separators=(',', ':')), encoding='utf-8')
+    os.replace(tmp, LATEST)
+
+
+def fetch_account(now):
+    """Ask your Claude account for the 5-hour and weekly numbers - the same
+    ones Claude Code's usage screen shows. Uses the login key Claude Code
+    saved and sends it only to Anthropic. This connection isn't documented,
+    so any failure just leaves the status-bar numbers in place."""
+    ACCOUNT['tried'] = now
+
+    def fail(why):
+        ACCOUNT.update(ok=False, why=why)
+
+    try:
+        login = json.loads((CONFIG_DIR / '.credentials.json').read_text(encoding='utf-8')).get('claudeAiOauth') or {}
+    except (OSError, ValueError, AttributeError):
+        return fail('no_login')
+    key = login.get('accessToken')
+    if not key:
+        return fail('no_login')
+    if is_num(login.get('expiresAt')) and login['expiresAt'] / 1000 <= now:
+        return fail('expired')
+    req = urllib.request.Request(ACCOUNT_URL, headers={
+        'Authorization': f'Bearer {key}', 'anthropic-beta': 'oauth-2025-04-20',
+        'Content-Type': 'application/json', 'User-Agent': 'claude-usage-tracker'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return fail('expired' if e.code == 401 else 'changed')
+    except (OSError, ValueError):
+        return fail('offline')
+
+    def meter(m):
+        if not isinstance(m, dict) or not is_num(m.get('utilization')):
+            return None
+        try:
+            reset = round(datetime.fromisoformat(m['resets_at']).timestamp()) if m.get('resets_at') else None
+        except (TypeError, ValueError):
+            reset = None
+        return {'used_percentage': whole(m['utilization']), 'resets_at': reset}
+
+    five, week = meter(d.get('five_hour') if isinstance(d, dict) else None), \
+        meter(d.get('seven_day') if isinstance(d, dict) else None)
+    if not five and not week:
+        return fail('changed')
+    try:
+        save_reading(five, week, now)
+    except OSError:
+        return fail('changed')
+    ACCOUNT.update(ok=True, why=None)
+
+
+def saved_at():
+    try:
+        v = json.loads(LATEST.read_text(encoding='utf-8')).get('saved_at')
+        return v if is_num(v) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def account_loop():
+    """While the status bar is quiet, ask the account every ACCOUNT_EVERY_S."""
+    while True:
+        now = time.time()
+        last = saved_at()
+        quiet = last is None or now - last >= ACCOUNT_EVERY_S
+        due = ACCOUNT['tried'] is None or now - ACCOUNT['tried'] >= ACCOUNT_EVERY_S
+        if quiet and due:
+            fetch_account(now)
+            REDRAW.set()
+        time.sleep(10)
+
+
+# ── frame ─────────────────────────────────────────────────────────────────
+
+def failure_text(check):
+    at = fmt_time(check['at'])
+    if check.get('reason') == 'no_plan':
+        return (f"A Claude Code session at {at} isn't signed in with your plan (API key or another "
+                'provider), so it has no plan limits to report.')
+    return (f'Claude Code answered a message at {at} but sent no usage numbers. A Claude Code update '
+            'may have changed how it reports them.')
+
+
 def load(now):
     """Returns (status, status_colour, message, data)."""
     try:
@@ -694,9 +832,14 @@ def load(now):
         return 'NOT UPDATING', RED, failure_text(check) + tail, data if has else None
     if not has:
         return "CAN'T READ", RED, 'The saved usage file has no usable numbers. It will fix itself on your next Claude Code message.', None
-    if now - data['saved_at'] > STALE_S:
-        return ('IDLE', AMBER, f'No Claude Code activity since {fmt_time(data["saved_at"])}. '
-                "If you've used claude.ai since then, these numbers are behind.", data)
+    age = now - data['saved_at']
+    if USE_ACCOUNT and ACCOUNT['ok'] is False and age > 2 * ACCOUNT_EVERY_S:
+        return ('IDLE', AMBER, f'No new numbers since {fmt_time(data["saved_at"])}. Checking your account '
+                f'directly failed: {ACCOUNT_WHY.get(ACCOUNT["why"], ACCOUNT["why"])}.', data)
+    if age > STALE_S:
+        tail = ("If you've used the desktop app or claude.ai since then, these numbers are behind."
+                if not USE_ACCOUNT else 'Checking your account directly...')
+        return 'IDLE', AMBER, f'No Claude Code activity since {fmt_time(data["saved_at"])}. {tail}', data
     return 'LIVE', GREEN, None, data
 
 
@@ -728,7 +871,8 @@ def frame(now, cols):
     out += sessions_panel(m, data.get('seven_day'), width)
 
     saved = data['saved_at']
-    info = f'Updated {fmt_time(saved)} ({fmt_ago(now - saved)})'
+    source = 'your account' if data.get('source') == 'account' else 'Claude Code'
+    info = f'Updated {fmt_time(saved)} ({fmt_ago(now - saved)}) from {source}'
     if m['since'] and LVL < 3 and not NARROW:
         info += (f' · saved log: {m["count"]} reading{"s" if m["count"] != 1 else ""} since '
                  f'{fmt_date(m["since"])}, {fmt_time(m["since"])}')
@@ -737,7 +881,7 @@ def frame(now, cols):
 
 
 def keys_line(now):
-    if NARROW:
+    if NARROW or LVL >= 3:
         return f' {paint("R", TEXT, bold=True)} {paint("refresh", MUTED)}  {paint("Q", TEXT, bold=True)} {paint("quit", MUTED)}'
     return (f' {paint("R", TEXT, bold=True)} {paint("refresh", MUTED)}   {paint("Q", TEXT, bold=True)} '
             f'{paint("quit", MUTED)}   {paint(f"auto-refresh every {REFRESH_S}s · checked {fmt_time(now)}", FAINT)}')
@@ -797,12 +941,15 @@ def main():
         os.system('title Claude Usage')
     w = sys.stdout.write
     threading.Thread(target=plan_loop, daemon=True).start()
+    if USE_ACCOUNT:
+        threading.Thread(target=account_loop, daemon=True).start()
     w('\x1b[?1049h\x1b[?25l')  # alternate screen, hide cursor
     try:
         last, last_size = 0.0, None
         while True:
             size = shutil.get_terminal_size()
-            if time.time() - last >= REFRESH_S or size != last_size:
+            if time.time() - last >= REFRESH_S or size != last_size or REDRAW.is_set():
+                REDRAW.clear()
                 w('\x1b[H' + '\n'.join(line + '\x1b[K' for line in render(size=size)) + '\x1b[J')
                 sys.stdout.flush()
                 last, last_size = time.time(), size

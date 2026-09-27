@@ -33,13 +33,27 @@ status bar and saves the numbers into your Claude folder (`~/.claude`):
 
 `claude-usage.py` reads those two files and draws the dashboard, re-reading
 every 30 seconds. It keeps nothing in memory, so closing it or rebooting loses
-nothing. It never contacts Anthropic: the numbers move when any Claude Code
-session sends a message (claude.ai usage shows up too, the next time Claude
-Code refreshes).
+nothing. The numbers move when any Claude Code session sends a message; see
+below for the desktop app and claude.ai.
+
+### Desktop app and claude.ai
+
+The status line is a terminal feature, so usage in the Claude desktop app or
+on claude.ai doesn't send new numbers by itself. To cover that, whenever the
+status line has been quiet for 2 minutes, the dashboard asks your Claude
+account for the same two numbers directly - every 2 minutes, only while the
+dashboard is open - and saves them to the same files (the footer then says
+"from your account").
+
+This uses the login key Claude Code saved in `~/.claude/.credentials.json`
+and sends it only to Anthropic, the same way Claude Code's usage screen does.
+The connection isn't documented by Anthropic and could change; if it stops
+working, the dashboard says why and keeps using the status line. Run with
+`--no-account` (or set `CLAUDE_USAGE_NO_ACCOUNT=1`) to turn it off.
 
 The banner shows your plan (Pro, Max, Team, Enterprise...) by asking Claude
 Code (`claude auth status`). The usage-limit size, such as "Max 5x", is read
-from Claude Code's saved login - only the plan fields, never the login keys.
+from the plan fields of Claude Code's saved login.
 
 ### The daily budget
 
