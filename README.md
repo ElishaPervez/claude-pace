@@ -73,12 +73,22 @@ be attributed to today, so that day is marked **Partial day**.
 
 ### Sessions per week
 
-The dashboard only compares readings taken inside the same 5-hour window and
-the same week, so resets never throw the numbers off. The meters report whole
-percentages, so each unbroken run of readings can be off by up to one point;
-the "likely" range accounts for that and tightens as usage adds up. The
-estimate appears once it has seen at least 25% of 5-hour usage and 3% of
-weekly usage.
+The weekly meter only shows whole percentages, so its true value is only
+known exactly at the moment it ticks up a point. From one tick to a later
+one, exactly that many weekly points were used - so the dashboard measures
+how much the 5-hour meter moved between two weekly ticks, adding up 5-hour
+usage across 5-hour resets. Nothing before the first tick it sees is used,
+so starting at 27.9% doesn't make the first 0.1% look like a whole point.
+
+Ticks are only compared within one source (account or status bar), because
+the status bar runs a point behind. The "likely" range allows for not
+knowing the exact moment of a tick, the 5-hour meter's own rounding, and a
+little unseen use at each 5-hour reset. Until either source has seen two
+ticks, a rougher whole-history estimate is shown, marked as rough.
+
+In simulations (`python tools/simulate_sessions.py`), the estimate is
+typically within 1-3% of the true value and the true value falls inside the
+range in 96-100% of runs, depending on which sources are available.
 
 ## Setup
 

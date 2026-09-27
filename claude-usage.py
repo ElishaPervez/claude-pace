@@ -64,6 +64,8 @@ STALE_S = 30 * 60
 MIN_SESSION_PTS = 25   # 5-hour points needed before the sessions-per-week ratio is shown
 MIN_WEEK_PTS = 3       # weekly points needed for the same
 SAME_WINDOW_S = 3600   # reset times closer than this belong to the same window
+FIVE_H_S = 5 * 3600
+RESET_ERR = 2          # 5-hour points that can go unseen at each 5-hour reset
 DAY_S = 86400
 WEEK_S = 7 * DAY_S
 MAX_TILES = 30
@@ -341,8 +343,104 @@ def session_math(samples):
     }
 
 
+def five_hour_totals(samples):
+    """Running total of 5-hour usage at each reading, carried across 5-hour
+    resets: (segment, total, resets so far) per reading, or None for a stale
+    reading. Within a window the total moves by the meter's change, so the
+    one-point gap between the two sources cancels out; at a reset it adds the
+    new window's reading. Readings that can't be trusted are skipped: one
+    taken after its own window ended, a status-bar reading still showing an
+    older window, or a drop bigger than the sources' one-point gap. A gap longer than
+    a whole window might hide a window we never saw, so it starts a new
+    segment."""
+    out, seg, total, resets, cur = [], 0, 0.0, 0, None
+    for s in samples:
+        if s['t'] >= s['hr'] + 60:  # taken after its own window ended: shows a dead window
+            out.append(None)
+            continue
+        if cur is not None:
+            same = abs(s['hr'] - cur['hr']) < SAME_WINDOW_S
+            if s['hr'] < cur['hr'] - SAME_WINDOW_S or (same and s['h'] < cur['h'] - SOURCE_SLACK):
+                out.append(None)  # an older window, or a drop too big to be the sources' gap
+                continue
+            if same:
+                total += s['h'] - cur['h']
+            elif s['t'] - cur['t'] <= FIVE_H_S:
+                total += s['h']
+                resets += 1
+            else:
+                seg, total, resets = seg + 1, 0.0, 0
+        cur = s
+        out.append((seg, total, resets))
+    return out
+
+
+def tick_math(samples, totals, src):
+    """Tick-to-tick measurement from one source (account or status bar).
+
+    The weekly meter's true value is only known exactly at the moment it
+    ticks up a point. From one tick to a later one, exactly (later - earlier)
+    weekly points were used, with no rounding guesswork - only the 5-hour
+    usage over the same stretch has to be measured. A tick happened somewhere
+    between two readings, so the 5-hour total at the tick is taken as the
+    middle of those two readings' totals, and half the gap goes into err,
+    plus 1 for the 5-hour meter's own rounding and RESET_ERR per 5-hour reset
+    in between (the old window's last bit of use can go unseen). Ticks are only compared within one source: the status bar runs
+    a point behind, so its ticks land later than the account's."""
+    stream = [(x, t) for x, t in zip(samples, totals) if x.get('src') == src and t is not None]
+    groups = {}
+    for (a, ta), (b, tb) in zip(stream, stream[1:]):
+        if abs(b['wr'] - a['wr']) >= SAME_WINDOW_S or b['w'] <= a['w'] or ta[0] != tb[0]:
+            continue
+        groups.setdefault((round(b['wr'] / SAME_WINDOW_S), tb[0]), []).append(
+            {'W': b['w'], 'c': (ta[1] + tb[1]) / 2, 'half': abs(tb[1] - ta[1]) / 2, 'r': tb[2]})
+    d5 = d7 = err = 0.0
+    most = 0
+    for ticks in groups.values():
+        most = max(most, len(ticks))
+        if len(ticks) < 2:
+            continue
+        first, last = ticks[0], ticks[-1]
+        d7 += last['W'] - first['W']
+        d5 += last['c'] - first['c']
+        err += first['half'] + last['half'] + 1 + RESET_ERR * (last['r'] - first['r'])
+    return {'d5': max(d5, 0.0), 'd7': d7, 'err': err, 'ticks': most}
+
+
+def estimate(samples):
+    """Sessions-per-week inputs for the panels. Uses tick-to-tick when either
+    source has seen the weekly meter tick twice in a row without a break;
+    otherwise the rough whole-history method, once it has enough data."""
+    # Rough method, one source at a time (mixing them biases it), keeping the
+    # source that has seen more weekly movement. Readings taken after their
+    # own 5-hour window ended show a dead window and are left out.
+    live = [x for x in samples if x['t'] < x['hr'] + 60]
+    rough = max((session_math([x for x in live if x.get('src') == src]) for src in ('account', None)),
+                key=lambda r: (r['d7'], r['d5']))
+    rough.update(since=samples[0]['t'] if samples else None, count=len(samples))
+    totals = five_hour_totals(samples)
+    best, most = None, 0
+    for src in ('account', None):
+        t = tick_math(samples, totals, src)
+        most = max(most, t['ticks'])
+        if t['d7'] >= 1 and t['d5'] > 0 and (best is None or t['err'] / t['d5'] < best['err'] / best['d5']):
+            best = t
+    m = dict(rough, ticks=most)
+    if best:
+        d5, d7, e = best['d5'], best['d7'], best['err']
+        m.update(d5=d5, d7=d7, err=e, method='ticks', ready=True,
+                 lo=max(d5 - e, 0) / d7, hi=(d5 + e) / d7)
+    elif rough['d5'] >= MIN_SESSION_PTS and rough['d7'] >= MIN_WEEK_PTS:
+        d5, d7, e = rough['d5'], rough['d7'], rough['err']
+        m.update(method='rough', ready=True, lo=(d5 - e) / (d7 + e),
+                 hi=(d5 + e) / (d7 - e) if d7 - e > 0 else None)
+    else:
+        m.update(method=None, ready=False)
+    return m
+
+
 def ratio_ready(m):
-    return m['d5'] >= MIN_SESSION_PTS and m['d7'] >= MIN_WEEK_PTS
+    return m['ready']
 
 
 def today_budget(week, samples, now):
@@ -511,23 +609,19 @@ def sessions_panel(m, week, width):
     if not m['since']:
         return panel(title, [paint('Recording starts with your next Claude Code message.', MUTED)], width)
 
-    seen = (f'Seen so far: {fmt_num(m["d5"])}% of 5-hour usage moved the week {fmt_num(m["d7"])}% · '
-            f'{m["windows"]} window{"s" if m["windows"] != 1 else ""} · since {fmt_date(m["since"])}')
     if not ratio_ready(m):
         half = max((inner - 26) // 2, 8)
         rows = [] if LVL >= 4 else [
             paint('Still measuring', AMBER, bold=True)
-            + ('' if NARROW else paint(' - the estimate appears once both bars fill.', MUTED)), '']
-        rows += [spread(paint('5-hour usage seen', MUTED), paint(f'{fmt_num(m["d5"])} / {MIN_SESSION_PTS}%', TEXT), 26)
-                 + ' ' + bar(m['d5'] / MIN_SESSION_PTS, half, color=ACCENT),
-                 spread(paint('Weekly usage seen', MUTED), paint(f'{fmt_num(m["d7"])} / {MIN_WEEK_PTS}%', TEXT), 26)
-                 + ' ' + bar(m['d7'] / MIN_WEEK_PTS, half, color=ACCENT)]
+            + ('' if NARROW else paint(' - exact once the weekly meter ticks up twice.', MUTED)), '']
+        rows += [spread(paint('Weekly ticks seen', MUTED), paint(f'{min(m["ticks"], 2)} / 2', TEXT), 26)
+                 + ' ' + bar(min(m['ticks'], 2) / 2, half, color=ACCENT),
+                 spread(paint('5-hour usage seen', MUTED), paint(f'{fmt_num(m["d5"])}%', TEXT), 26)]
         return panel(title + (' - still measuring' if LVL >= 4 else ''), rows, width)
 
     sessions = m['d5'] / m['d7']
-    lo = (m['d5'] - m['err']) / (m['d7'] + m['err'])
-    hi = (m['d5'] + m['err']) / (m['d7'] - m['err']) if m['d7'] - m['err'] > 0 else None
-    rng = f'likely {fmt_num(lo)}–{fmt_num(hi)}' if hi is not None else f'at least {fmt_num(lo)}'
+    rng = (f'likely {fmt_num(m["lo"])}–{fmt_num(m["hi"])}' if m['hi'] is not None
+           else f'at least {fmt_num(m["lo"])}')
     rows = [spread(f'{paint("≈ " + fmt_num(sessions), ACCENT, bold=True)} '
                    f'{paint("full 5-hour sessions fill the week", TEXT)}', paint(rng, MUTED), inner)]
     if is_limit(week) and LVL < 4:
@@ -541,6 +635,13 @@ def sessions_panel(m, week, width):
                 f'{paint("1 session", MUTED)} ≈ {paint(fmt_num(100 * m["d7"] / m["d5"]) + "%", TEXT, bold=True)} '
                 f'{paint("of the week", MUTED)}')
     if LVL < 3:
+        pts = f'{fmt_num(m["d7"])} exact weekly point{"s" if m["d7"] != 1 else ""}'
+        if m['method'] == 'ticks':
+            seen = (f'Measured tick to tick: {fmt_num(m["d5"])}% of 5-hour usage over {pts} · '
+                    f'since {fmt_date(m["since"])}')
+        else:
+            seen = (f'Rough until the weekly meter ticks twice: {fmt_num(m["d5"])}% of 5-hour usage moved '
+                    f'the week {fmt_num(m["d7"])}% · since {fmt_date(m["since"])}')
         rows += wrap(seen, inner, FAINT)
     return panel(title, rows, width)
 
@@ -905,7 +1006,7 @@ def frame(now, cols):
         return out, width
 
     samples = read_history()
-    m = session_math(samples)
+    m = estimate(samples)
     t = today_budget(data.get('seven_day'), samples, now)
     out += limits_panel(data, t, width, now)
     out += today_panel(t, m, width, now)
@@ -915,9 +1016,8 @@ def frame(now, cols):
     source = 'your account' if data.get('source') == 'account' else 'Claude Code'
     info = f'Updated {fmt_time(saved)} ({fmt_ago(now - saved)}) from {source}'
     if m['since'] and LVL < 3 and not NARROW:
-        info += (f' · saved log: {m["count"]} reading{"s" if m["count"] != 1 else ""} since '
-                 f'{fmt_date(m["since"])}, {fmt_time(m["since"])}')
-    out.append(' ' + paint(info, FAINT))
+        info += f' · log: {m["count"]} reading{"s" if m["count"] != 1 else ""} since {fmt_date(m["since"])}'
+    out.append(clip(' ' + paint(info, FAINT), width))
     return out, width
 
 
