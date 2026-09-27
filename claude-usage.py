@@ -22,7 +22,8 @@ The plan name in the banner comes from asking Claude Code
 Nothing is kept in memory between runs - every frame is worked out from those
 files, so restarts lose nothing.
 
-Keys: R = re-read now, Q / Esc / Ctrl+C = quit. Re-reads every 30 s.
+Keys: R = fetch fresh numbers from your account now, Q / Esc / Ctrl+C = quit.
+Re-reads the files every 30 s.
 Flags: --once        print one frame and exit (no account check)
        --no-account  never ask your account directly; status bar only
 Env:   CLAUDE_CONFIG_DIR  your Claude folder, if it isn't ~/.claude
@@ -796,6 +797,15 @@ def fetch_account(now):
     ACCOUNT.update(ok=True, why=None)
 
 
+def refresh_now():
+    """R key: fresh numbers from the account and a fresh plan name, without
+    freezing the window while they load (about a second)."""
+    if USE_ACCOUNT:
+        fetch_account(time.time())
+    refresh_plan()
+    REDRAW.set()
+
+
 def account_loop():
     """Ask the account every ACCOUNT_EVERY_S while the dashboard is open."""
     while True:
@@ -987,8 +997,8 @@ def main():
             if msvcrt and msvcrt.kbhit():
                 key = msvcrt.getwch()
                 if key in ('r', 'R'):
-                    refresh_plan()
-                    last = 0.0
+                    last = 0.0  # redraw from the files now...
+                    threading.Thread(target=refresh_now, daemon=True).start()  # ...and again with fresh numbers
                 elif key in ('q', 'Q', '\x1b', '\x03'):
                     break
             time.sleep(0.1)

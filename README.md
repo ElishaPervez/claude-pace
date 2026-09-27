@@ -95,7 +95,7 @@ weekly usage.
 3. Send any message in Claude Code, then run `Claude Usage.bat` (or
    `python claude-usage.py`).
 
-Keys: **R** re-read now, **Q** / **Esc** quit. `--once` prints one frame and exits.
+Keys: **R** fetch fresh numbers from your account now, **Q** / **Esc** quit. `--once` prints one frame and exits.
 
 If your Claude folder isn't `~/.claude`, set `CLAUDE_CONFIG_DIR` - both scripts
 respect it.
