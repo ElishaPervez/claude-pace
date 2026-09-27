@@ -1,0 +1,6 @@
+# Personal usage data and logins live in ~/.claude, never here - but just in case:
+usage-latest.json
+usage-history.jsonl
+*.tmp
+.credentials.json
+__pycache__/
