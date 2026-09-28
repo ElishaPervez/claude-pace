@@ -11,9 +11,9 @@ built-in meters don't:
   "about 9 full 5-hour sessions use up the whole week", with a range that
   narrows as it sees more.
 
-![Dashboard](https://raw.githubusercontent.com/ElishaPervez/claude-pace/main/docs/screenshot.png)
+![claude-pace demo](https://raw.githubusercontent.com/ElishaPervez/claude-pace/main/docs/demo.webp)
 
-*(Screenshot uses made-up numbers.)*
+*(Demo uses made-up numbers.)*
 
 One Python file, no dependencies, works on macOS, Linux and Windows.
 
